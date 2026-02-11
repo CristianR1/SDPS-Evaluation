@@ -1,0 +1,50 @@
+datasets:
+  input_documents:
+    type: file
+    path: input_documents.json
+default_model: gpt-4o-mini
+operations:
+- name: op_0_filter
+  type: filter
+  prompt: 'Analyze the following narrative: "{input.contents}". If the source of income
+    is fundraising within the narrative, respond with true'
+  output:
+    schema:
+      keep: boolean
+  model: gpt-4o-mini
+- name: op_1_filter
+  type: filter
+  prompt: 'Analyze the following narrative: "{input.contents}". If the date received
+    is 2019/9/14 within the narrative, respond with true'
+  output:
+    schema:
+      keep: boolean
+  model: gpt-4o-mini
+- name: op_2_extract
+  type: extract
+  prompt: Analyze the narrative. Extract the notes of the fundraising
+  document_keys:
+  - contents
+  output:
+    schema:
+      extracted_value: str
+  model: gpt-4o-mini
+pipeline:
+  name: semantic_pipeline
+  steps:
+  - name: op_0_filter
+    operations:
+    - op_0_filter
+    input: input_documents
+  - name: op_1_filter
+    operations:
+    - op_1_filter
+    input: op_0_filter
+  - name: op_2_extract
+    operations:
+    - op_2_extract
+    input: op_1_filter
+  output:
+    type: file
+    path: results/docetl/docetl_result.json
+    intermediate_dir: interim

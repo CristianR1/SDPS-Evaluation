@@ -8,7 +8,6 @@ import copy
 import os
 import re
 import json
-import shutil
 import sqlite3
 import argparse
 import time
@@ -124,11 +123,15 @@ class FilterOperation(Operation):
 
 
 class ExtractOperation(Operation):
+    _extract_counter = 0
+
     def __init__(self, instruction: str):
         super().__init__(instruction)
+        ExtractOperation._extract_counter += 1
+        self._col_name = f"extraction_{ExtractOperation._extract_counter}"
         self.output_cols = [
             {
-                "name": "extraction",
+                "name": self._col_name,
                 "type": str,
                 "desc": f"Extract ONLY: {instruction}. Return just the value, nothing else.",
             }
@@ -141,17 +144,18 @@ class ExtractOperation(Operation):
         return False
 
 
+class UnsupportedOperationError(Exception):
+    """Raised when a pipeline operation is not supported by palimpzest."""
+    pass
+
+
 class RankOperation(Operation):
     def __init__(self, instruction: str, k: int = 1):
         super().__init__(instruction)
         self.k = k
 
     def execute(self, dataset: pz.Dataset) -> pz.Dataset:
-        return dataset.sem_topk(
-            self.instruction,
-            k=self.k,
-            depends_on=["contents"],
-        )
+        raise UnsupportedOperationError("RANK (TopK) is not supported by palimpzest semantically on a document level")
 
     def modifies_docset(self) -> bool:
         return True
@@ -179,7 +183,6 @@ class JoinOperation(Operation):
 
 class AggregateOperation(Operation):
     def execute(self, dataset: pz.Dataset) -> pz.Dataset:
-        # sem_agg() requires col (output field spec) and agg (natural language instruction)
         return dataset.sem_agg(
             col={
                 "name": "aggregate",
@@ -200,18 +203,13 @@ class GroupOperation(Operation):
         self.group_by = group_by
 
     def execute(self, dataset: pz.Dataset) -> pz.Dataset:
-        if self.group_by:
-            return dataset.group_by(self.group_by)
-        return dataset.sem_partition_by(
-            self.instruction,
-            depends_on=["contents"],
-        )
+        raise UnsupportedOperationError("GROUP is not supported by palimpzest semantically on a document level")
 
     def modifies_docset(self) -> bool:
         return True
 
 
-# --- DocumentManager: multi-table like lotus, builds data_paths per table ---
+#build data_path per table
 class DocumentManager:
     def __init__(self, base_path: str, table_names: list):
         self.base_path = Path(base_path)
@@ -221,10 +219,8 @@ class DocumentManager:
             database_name = database_tables.get(table)
             if database_name:
                 self.data_paths.append(self.base_path / "data" / database_name / table)
-        self.interim_path = self.base_path / "interim"
         for path in self.data_paths:
             path.mkdir(parents=True, exist_ok=True)
-        self.interim_path.mkdir(parents=True, exist_ok=True)
 
     def load_dataset(self, source_path: str) -> pz.Dataset:
         path = str(source_path)
@@ -233,11 +229,6 @@ class DocumentManager:
 
     def load_datasets(self) -> list:
         return [self.load_dataset(p) for p in self.data_paths]
-
-    def clear_interim(self):
-        if self.interim_path.exists():
-            shutil.rmtree(self.interim_path)
-        self.interim_path.mkdir(parents=True, exist_ok=True)
 
 
 def _output_to_df(output) -> pd.DataFrame:
@@ -289,16 +280,18 @@ class Pipeline:
 
     def log(self, message: str):
         if self.verbose:
-            print(f"[PALIMPZEST] {message}")
+            print(message)
 
-    def _parse_ops_from_segment(self, segment_str: str, collect_ops: bool = True) -> list:
-        """Parse a segment (comma-separated 'TYPE - instruction') into list of Operation objects.
-        If collect_ops=True, appends OP:... to self.operations; use False when building path ops.
+    def _parse_ops_from_segment(self, segment_str: str, collect_ops: bool = True, ops_target: list | None = None) -> list:
+        """Parse a segment ('TYPE - instruction' separated by &&) into list of Operation objects.
+        If collect_ops=True, appends OP:... to ops_target or self.operations.
         """
         operations = []
         if not segment_str or not isinstance(segment_str, str):
             return operations
-        parts = [p.strip() for p in segment_str.split(",") if p.strip()]
+        target = ops_target if ops_target is not None else self.operations
+        
+        parts = [p.strip() for p in segment_str.split("&&") if p.strip()]
         for part in parts:
             if " - " in part:
                 op_type, instruction = part.split(" - ", 1)
@@ -316,99 +309,142 @@ class Pipeline:
                     operations.append(AggregateOperation(instruction))
                 elif op_type == "GROUP":
                     operations.append(GroupOperation(instruction))
-            elif collect_ops and ": " in part:
-                _, operations_str = part.split(": ", 1)
-                for op in operations_str.split(","):
-                    self.operations.append(op.strip())
+                elif op_type == "OP" and collect_ops:
+                    for op in instruction.split(","):
+                        target.append(op.strip())
+            elif collect_ops and part.strip().startswith("OP:"):
+                op_part = part.strip()[3:].strip()
+                for op in op_part.split(","):
+                    target.append(op.strip())
         return operations
 
-    @staticmethod
-    def _tree_leaf_paths(n: int) -> list:
-        """
-        Treat n segments as a complete binary tree (index 0 = root; 2*i+1 left, 2*i+2 right).
-        Return all root-to-leaf paths (each path = list of segment indices).
-        """
-        if n <= 0:
-            return []
-        if n == 1:
-            return [[0]]
-        leaves = [i for i in range(n) if 2 * i + 1 >= n]
+    def _parse_single_pipeline(self, format_str: str) -> dict:
+        """Parse one pipeline segment. Returns {paths, operations}."""
+        ops_for_this = []
+        format_str = format_str.strip()
+        
+        if " / " not in format_str:
+            trunk_ops = self._parse_ops_from_segment(format_str, collect_ops=True, ops_target=ops_for_this)
+            return {"paths": [trunk_ops], "operations": ops_for_this}
+        
+        first_split_idx = format_str.find(" / ")
+        trunk_str = format_str[:first_split_idx].strip()
+        branches_str = format_str[first_split_idx + 3:].strip()
+        
+        trunk_ops = self._parse_ops_from_segment(trunk_str, collect_ops=False)
+        branches = []
+        remaining = branches_str
+        
+        while remaining:
+            remaining = remaining.strip()
+            if not remaining:
+                break
+            if remaining.startswith("OP:") or remaining.startswith("&& OP:"):
+                if remaining.startswith("&& "):
+                    remaining = remaining[3:]
+                op_part = remaining[3:].strip()
+                for op in op_part.split(","):
+                    ops_for_this.append(op.strip())
+                break
+            pipe_idx = remaining.find("|")
+            if pipe_idx == -1:
+                if remaining.strip().startswith("OP:") or " OP:" in remaining:
+                    if remaining.strip().startswith("OP:"):
+                        op_part = remaining.strip()[3:].strip()
+                        for op in op_part.split(","):
+                            ops_for_this.append(op.strip())
+                    elif "&& OP:" in remaining:
+                        parts = remaining.split("&& OP:")
+                        if parts[0].strip():
+                            branch_ops = self._parse_ops_from_segment(parts[0].strip(), collect_ops=False)
+                            if branch_ops:
+                                branches.append(branch_ops)
+                        if len(parts) > 1:
+                            for op in parts[1].split(","):
+                                ops_for_this.append(op.strip())
+                else:
+                    branch_ops = self._parse_ops_from_segment(remaining, collect_ops=False)
+                    if branch_ops:
+                        branches.append(branch_ops)
+                break
+            branch_content = remaining[:pipe_idx].strip()
+            remaining = remaining[pipe_idx + 1:].strip()
+            if remaining.startswith("/"):
+                remaining = remaining[1:].strip()
+            elif remaining.startswith(" / "):
+                remaining = remaining[3:].strip()
+            if branch_content:
+                branch_ops = self._parse_ops_from_segment(branch_content, collect_ops=False)
+                branches.append(branch_ops)
+            else:
+                branches.append([])
+        
         paths = []
-        for leaf in leaves:
-            path = []
-            i = leaf
-            while True:
-                path.append(i)
-                if i == 0:
-                    break
-                i = (i - 1) // 2
-            path.reverse()
-            paths.append(path)
-        return paths
+        if not branches:
+            paths.append(trunk_ops)
+        else:
+            for branch_ops in branches:
+                path = list(trunk_ops) + list(branch_ops)
+                paths.append(path)
+            if "percent count" in ops_for_this and len(branches) == 1:
+                paths.append(list(trunk_ops))
+        
+        return {"paths": paths, "operations": ops_for_this}
 
     def parse_format(self, format_str: str):
         """
-        Palimpzest-friendly parse:
-        - No && and no / : one pipeline (one path), executed whole.
-        - && : split into separate trees; each tree expanded to paths independently.
-        - /  : build a tree of segments; expand to all root-to-leaf paths (one full pipeline per path).
-        So e.g. one split then two splits (4 leaves) => 4 pipelines executed.
+        Parse format string. Multi-pipeline: ' |-| ' separates pipelines (one per SELECT expression).
+        Each pipeline: trunk / branch1 | / branch2 | && OP: post_ops (DFS-style paths).
         """
         self.pipelines = []
+        self.pipeline_groups = []
         self.operations = []
-        tree_strings = [t.strip() for t in format_str.split("&&") if t.strip()]
-        for ops_str in tree_strings:
-            if not ops_str:
-                continue
-            segments = [s.strip() for s in ops_str.split(" / ")]
-            if not segments:
-                continue
-            segment_ops = []
-            for seg in segments:
-                seg_ops = self._parse_ops_from_segment(seg, collect_ops=True)
-                segment_ops.append(seg_ops)
-            paths = self._tree_leaf_paths(len(segments))
-            self.pipelines.append({
-                "segments": segments,
-                "segment_ops": segment_ops,
-                "paths": paths,
-            })
-        total_pipelines = sum(len(p["paths"]) for p in self.pipelines)
-        self.log(f"Parsed {len(self.pipelines)} tree(s), {total_pipelines} root-to-leaf path(s) (one pipeline each)")
+        
+        format_str = format_str.strip()
+        if not format_str:
+            return
+        
+        segments = [s.strip() for s in format_str.split(" |-| ") if s.strip()]
+        if not segments:
+            segments = [format_str]
+        
+        for seg in segments:
+            group = self._parse_single_pipeline(seg)
+            self.pipeline_groups.append(group)
+            self.pipelines.append({"paths": group["paths"]})
+        
+        if len(self.pipeline_groups) == 1:
+            self.operations = self.pipeline_groups[0]["operations"]
+        
+        total = sum(len(g["paths"]) for g in self.pipeline_groups)
+        self.log(f"Parsed {len(self.pipeline_groups)} pipeline(s), {total} total paths")
 
-    def clear(self):
-        self.log("Clearing interim data...")
-        self.doc_manager.clear_interim()
-        self.log("Interim data cleared")
-
-    def execute(self, run_mode: str = "max_quality", clear_interim: bool = False) -> list:
-        """
-        Execute one full palimpzest pipeline per root-to-leaf path.
-        Each path is built as a single chain of operations and run() once (palimpzest executes whole).
-        Returns list of DataFrames, one per path.
-        """
-        if clear_interim:
-            self.clear()
+    def execute(self, run_mode: str = "max_quality") -> list:
+        """Execute pipelines. Multi-pipeline: returns list of {dfs, operations} per group."""
         run_kw = {"max_quality": True} if run_mode == "max_quality" else {"min_cost": True}
-        dfs_out = []
+        all_group_results = []
+        self.total_pz_time = 0.0
+        self.total_pz_cost = 0.0
+        self.total_pz_tokens = 0
+        self._seen_pz_op_ids: set[str] = set()
         datasets = self.doc_manager.load_datasets()
         total_docs = sum(len(list(Path(p).glob("*.txt"))) for p in self.doc_manager.data_paths)
         self.results = [{"operation": "initial", "doc_count": total_docs, "tables": len(datasets)}]
 
-        for tree_idx, pipeline in enumerate(self.pipelines):
-            segment_ops = pipeline["segment_ops"]
-            paths = pipeline["paths"]
+        pipeline_groups = getattr(self, "pipeline_groups", None)
+        if not pipeline_groups:
+            pipeline_groups = [{"paths": p["paths"], "operations": self.operations} for p in self.pipelines]
 
-            for path_idx, path in enumerate(paths):
-                path_ops = []
-                for seg_idx in path:
-                    for op in segment_ops[seg_idx]:
-                        if type(op).__name__ == "GroupOperation":
-                            continue
-                        path_ops.append(copy.deepcopy(op))
+        for group_idx, group in enumerate(pipeline_groups):
+            paths = group["paths"]
+            group_dfs = []
+
+            for path_idx, path_ops in enumerate(paths):
+                path_ops = [op for op in path_ops if type(op).__name__ != "GroupOperation"]
+                path_ops = [copy.deepcopy(op) for op in path_ops]
 
                 if not path_ops:
-                    self.log(f"Tree {tree_idx + 1} path {path_idx + 1}: no ops, skipping")
+                    self.log(f"Group {group_idx + 1} path {path_idx + 1}: no ops, skipping")
                     continue
 
                 join_idx = 0
@@ -421,6 +457,7 @@ class Pipeline:
                 if not datasets:
                     self.log("No datasets to load")
                     continue
+                
                 if not join_ops:
                     current = datasets[0]
                     dataset_list = datasets[1:]
@@ -452,15 +489,39 @@ class Pipeline:
                         "modifies_docset": op.modifies_docset(),
                     })
 
-                self.log(f"Running pipeline for tree {tree_idx + 1} path {path_idx + 1} (whole)...")
+                self.log(f"Running group {group_idx + 1} path {path_idx + 1} (DFS - complete path)...")
                 output = current.run(**run_kw)
                 df = _output_to_df(output)
-                dfs_out.append(df)
+                group_dfs.append(df)
                 if self.results:
                     self.results[-1]["doc_count"] = len(df) if not df.empty else 0
                 self.log(f"Path {path_idx + 1} complete - {len(df)} rows")
 
-        return dfs_out
+                # Accumulate execution stats per-operator, deduplicating trunk ops.
+                # For a split pipeline, path 1 and path 2 both re-execute the same
+                # trunk operators (for now, optimization req). Since unique_full_op_id is a deterministic content
+                # hash that is identical for trunk ops across all paths, we skip any
+                # operator we've already counted.
+                es = getattr(output, "execution_stats", None)
+                if es is not None:
+                    for plan_stats in es.plan_stats.values():
+                        for unique_op_id, op_stats in plan_stats.operator_stats.items():
+                            if unique_op_id not in self._seen_pz_op_ids:
+                                self._seen_pz_op_ids.add(unique_op_id)
+                                self.total_pz_time += op_stats.total_op_time
+                                self.total_pz_cost += op_stats.total_op_cost
+                                self.total_pz_tokens += (
+                                    op_stats.total_input_tokens + op_stats.total_output_tokens
+                                )
+
+            original_doc_count = total_docs
+            all_group_results.append({
+                "dfs": group_dfs,
+                "operations": group["operations"],
+                "original_doc_count": original_doc_count,
+            })
+
+        return all_group_results
 
 
 # --- Reused from lotus_pipeline: SQL and evaluation helpers ---
@@ -601,13 +662,18 @@ def _normalize_for_compare(val) -> str:
     return " ".join(sorted(re.findall(r"[a-z0-9]+", str(val).lower())))
 
 
-def _answers_match(extracted: list, ground_truth: list) -> bool:
-    """True if stripped/cleaned words and numerics in extracted match ground_truth.
-    Also robust to numeric formatting: if all ground-truth numbers appear (within tolerance)
-    somewhere in the extracted answer, it counts as correct.
+def _answers_match(extracted, ground_truth: list) -> bool:
+    """True if extracted matches ground_truth.
+    Handles: extracted as tuple (multi-pipeline), ground_truth as [(a,b)] or [a,b].
     """
-    norm_ex = _normalize_for_compare(extracted)
-    norm_gt = _normalize_for_compare(ground_truth)
+    if not ground_truth:
+        return not extracted
+    ex = extracted if isinstance(extracted, (list, tuple)) else [extracted]
+    gt = ground_truth
+    if len(gt) == 1 and isinstance(gt[0], (list, tuple)) and len(ex) == len(gt[0]):
+        gt = list(gt[0])
+    norm_ex = _normalize_for_compare(ex)
+    norm_gt = _normalize_for_compare(gt)
     if norm_ex == norm_gt:
         return True
 
@@ -622,8 +688,8 @@ def _answers_match(extracted: list, ground_truth: list) -> bool:
                 continue
         return out
 
-    ex_nums = _extract_numbers(extracted)
-    gt_nums = _extract_numbers(ground_truth)
+    ex_nums = _extract_numbers(ex)
+    gt_nums = _extract_numbers(gt)
     if gt_nums and ex_nums:
         tol = 1e-2
         all_present = True
@@ -646,13 +712,14 @@ def _get_ground_truth(db_path: str, database_name: str, sql: str):
         return []
 
 
-def aggregate_metrics_to_csv(rows: list, output_dir: str = "./pipeline_data/results/palimpzest") -> str:
+def aggregate_metrics_to_csv(rows: list, output_dir: str = "./pipeline_data/results/palimpzest", num_skipped_unsupported: int = 0) -> str:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     filepath = output_path / "palimpzest_metrics.csv"
     fieldnames = [
         "question_number", "question_id", "db_id", "difficulty", "num_documents",
-        "altered_sql", "execution_time_seconds", "llm_total_tokens", "llm_total_cost",
+        "altered_sql", "execution_time_seconds", "pz_execution_time_seconds",
+        "llm_total_tokens", "llm_total_cost",
         "correct", "extracted", "ground_truth",
     ]
     if not rows:
@@ -668,6 +735,7 @@ def aggregate_metrics_to_csv(rows: list, output_dir: str = "./pipeline_data/resu
             row_export["ground_truth"] = str(r.get("ground_truth", ""))[:500]
             writer.writerow(row_export)
     total_time = sum(r.get("execution_time_seconds") or 0 for r in rows)
+    total_pz_time = sum(r.get("pz_execution_time_seconds") or 0 for r in rows)
     total_tokens = sum(r.get("llm_total_tokens") or 0 for r in rows)
     total_cost = sum(r.get("llm_total_cost") or 0 for r in rows)
     num_correct = sum(1 for r in rows if r.get("correct") is True)
@@ -676,11 +744,14 @@ def aggregate_metrics_to_csv(rows: list, output_dir: str = "./pipeline_data/resu
         w = csv.writer(f)
         w.writerow(["metric", "value"])
         w.writerow(["total_questions", len(rows)])
-        w.writerow(["total_execution_time_seconds", round(total_time, 4)])
+        w.writerow(["total_wall_time_seconds", round(total_time, 4)])
+        w.writerow(["total_pz_execution_time_seconds", round(total_pz_time, 4)])
         w.writerow(["total_llm_tokens", total_tokens])
         w.writerow(["total_llm_cost", round(total_cost, 6)])
         w.writerow(["num_correct", num_correct])
         w.writerow(["accuracy", round(num_correct / len(rows), 4) if rows else 0])
+        w.writerow(["num_skipped_unsupported", num_skipped_unsupported])
+        w.writerow(["unsupported_operations", "RANK (TopK), GROUP"])
     return str(filepath)
 
 
@@ -690,7 +761,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     num_documents = args.num_documents
 
-    MINIDEV_PATH = Path(__file__).parent.parent.parent / "DGS" / "data" / "MINIDEV"
+    MINIDEV_PATH = Path(__file__).parent.parent.parent / "SDPS-Evaluation" / "demo" / "MINIDEV"
     DB_PATH = MINIDEV_PATH / "dev_databases"
 
     with open("questions.json", encoding="utf-8") as f:
@@ -712,7 +783,15 @@ if __name__ == "__main__":
             if e["db_id"] in ALLOWED_DB_IDS
             and e["difficulty"] in ALLOWED_DIFFICULTIES
             and "GROUP -" not in (e.get("format") or "")
+            and "RANK -" not in (e.get("format") or "")
         ]
+
+        num_skipped_unsupported = sum(
+            1 for e in ordered_entries
+            if e["db_id"] in ALLOWED_DB_IDS
+            and e["difficulty"] in ALLOWED_DIFFICULTIES
+            and ("GROUP -" in (e.get("format") or "") or "RANK -" in (e.get("format") or ""))
+        )
 
         metrics_rows = []
         for question_number, entry in enumerate(filtered_entries, start=1):
@@ -722,16 +801,17 @@ if __name__ == "__main__":
             if not database_name:
                 continue
             doc_manager = DocumentManager("./pipeline_data", tables_list)
+            ExtractOperation._extract_counter = 0
             pipeline = Pipeline(doc_manager, verbose=True)
             pipeline.parse_format(sequence)
 
             start_time = time.perf_counter()
-            result = None
+            execute_result = None
             try:
-                result = pipeline.execute(run_mode="max_quality", clear_interim=True)
+                execute_result = pipeline.execute(run_mode="max_quality")
             except Exception as e:
                 execution_time_seconds = time.perf_counter() - start_time
-                print(f"\n[PALIMPZEST] Error on question {question_number} ({entry.get('question_id', '')}): {e}")
+                print(f"\nError on question {question_number} ({entry.get('question_id', '')}): {e}")
                 import traceback
                 traceback.print_exc()
                 # Mark as wrong and record metrics so the set can finish
@@ -745,6 +825,7 @@ if __name__ == "__main__":
                     "num_documents": 0,
                     "altered_sql": limited_sql,
                     "execution_time_seconds": round(execution_time_seconds, 4),
+                    "pz_execution_time_seconds": round(pipeline.total_pz_time, 4),
                     "llm_total_tokens": 0,
                     "llm_total_cost": 0.0,
                     "correct": False,
@@ -755,131 +836,240 @@ if __name__ == "__main__":
 
             execution_time_seconds = time.perf_counter() - start_time
 
-            llm_tokens = 0
-            llm_cost = 0.0
+            llm_tokens = pipeline.total_pz_tokens
+            llm_cost = pipeline.total_pz_cost
+            pz_execution_time = pipeline.total_pz_time
             num_docs_processed = pipeline.results[0]["doc_count"] if pipeline.results else 0
             limited_sql = limit_sql_to_num_documents(entry["SQL"], num_documents)
 
+            def _doc_count(df):
+                if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                    return 0
+                return len(df["contents"]) if "contents" in df.columns else len(df)
+
+            def _get_df_value(df):
+                if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                    return 0
+                if 'aggregate' in df.columns and len(df) > 0:
+                    val = df['aggregate'].iloc[0]
+                    if val is not None:
+                        try:
+                            return float(val)
+                        except (ValueError, TypeError):
+                            return val
+                ext_cols = [c for c in df.columns if c.startswith("extraction")]
+                if ext_cols and len(df) > 0:
+                    val = df[ext_cols[-1]].iloc[0]
+                    if val is not None:
+                        try:
+                            return float(val)
+                        except (ValueError, TypeError):
+                            return val
+                return _doc_count(df)
+
             final_result = []
-            for idx, df in enumerate(result):
-                try:
-                    col = "contents" if "contents" in df.columns else df.columns[0] if len(df.columns) else None
-                    if col is None or len(df) == 0:
-                        raise ValueError
-                    print(f"Dataframe {idx} contains {len(df)} documents")
-                except Exception:
-                    print(f"Dataframe {idx} has no documents, setting result to none")
-                    final_result.append("None")
-                    break
-
-            if not final_result:
-                def _doc_count(df):
-                    return len(df["contents"]) if "contents" in df.columns else len(df)
-
+            for group_idx, group_result in enumerate(execute_result):
+                result = group_result["dfs"]
+                operations = group_result["operations"]
+                has_zero_doc_df = any(_doc_count(df) == 0 for df in result if df is not None)
+                op_failed = False
                 prev_was_comparison = False
-                for operation in pipeline.operations:
-                    print(operation)
+                group_values = []
+                
+                for idx, df in enumerate(result):
+                    if df is not None:
+                        doc_count = _doc_count(df)
+                        print(f"Group {group_idx + 1} dataframe {idx} contains {doc_count} documents")
+                        if 'aggregate' in df.columns and len(df) > 0:
+                            print(f"  has aggregate: {df['aggregate'].iloc[0]}")
+                
+                for operation in operations:
+                    print(f"Executing OP (group {group_idx + 1}): {operation}")
                     if operation == "ratio":
                         try:
                             if len(result) == 2:
-                                c0, c1 = _doc_count(result[0]), _doc_count(result[1])
-                                final_result.append(f"{c0}:{c1}")
+                                v0, v1 = _get_df_value(result[0]), _get_df_value(result[1])
+                                if v1 == 0:
+                                    group_values.append('None')
+                                else:
+                                    group_values.append(f"{v0} / {v1}")
                             else:
                                 raise ValueError("ratio requires exactly two results")
-                        except (ValueError, KeyError) as e:
-                            print(f"Pipeline ratio operation: {e}")
+                        except (ValueError, KeyError, ZeroDivisionError) as e:
+                            print(f"Pipeline ratio operation failed: {e}")
+                            op_failed = True
                         prev_was_comparison = False
                     elif operation == "total":
                         try:
                             if len(result) == 1:
-                                final_result.append(str(_doc_count(result[0])))
+                                group_values.append(str(_doc_count(result[0])))
                             else:
                                 raise ValueError("total requires exactly one result")
                         except (ValueError, KeyError) as e:
-                            print(f"Pipeline total operation: {e}")
+                            print(f"Pipeline total operation failed: {e}")
+                            op_failed = True
+                        prev_was_comparison = False
+                    elif operation in ("percent count", "percent sum"):
+                        try:
+                            if operation == "percent count" and len(result) == 1:
+                                num = _get_df_value(result[0])
+                                denom = original_doc_count
+                                if denom == 0 or num == 0:
+                                    group_values.append("None")
+                                else:
+                                    percent = (num / denom) * 100
+                                    group_values.append(f"{percent}")
+                            elif operation == "percent count" and len(result) == 2:
+                                num = _get_df_value(result[0])
+                                denom = _doc_count(result[1])
+                                if denom == 0 or num == 0:
+                                    group_values.append("None")
+                                else:
+                                    percent = (num / denom) * 100
+                                    group_values.append(f"{percent}")
+                            elif len(result) == 2:
+                                num, denom = _get_df_value(result[0]), _get_df_value(result[1])
+                                if denom == 0 or num == 0:
+                                    group_values.append("None")
+                                else:
+                                    percent = (num / denom) * 100
+                                    group_values.append(f"{percent}")
+                            else:
+                                raise ValueError(f"{operation} requires two results")
+                        except (ValueError, KeyError, ZeroDivisionError) as e:
+                            print(f"Pipeline {operation} operation failed: {e}")
+                            op_failed = True
+                        prev_was_comparison = False
+                    elif operation == "percent":
+                        try:
+                            if len(result) == 2:
+                                num, denom = _get_df_value(result[0]), _get_df_value(result[1])
+                                if denom == 0:
+                                    group_values.append("None")
+                                else:
+                                    percent = (num / denom) * 100
+                                    group_values.append(f"{percent}")
+                            else:
+                                raise ValueError("percent requires exactly two results")
+                        except (ValueError, KeyError, ZeroDivisionError) as e:
+                            print(f"Pipeline percent operation failed: {e}")
+                            op_failed = True
                         prev_was_comparison = False
                     elif operation == "percent reverse":
                         try:
                             if len(result) == 2:
-                                c0, c1 = _doc_count(result[0]), _doc_count(result[1])
-                                percent = (c1 / c0) * 100 if c0 else 0
-                                final_result.append(f"{percent}")
+                                num, denom = _get_df_value(result[0]), _get_df_value(result[1])
+                                if denom == 0 or num == 0:
+                                    group_values.append("None")
+                                else:
+                                    percent = (num / denom) * 100
+                                    group_values.append(f"{percent}")
                             else:
                                 raise ValueError("percent reverse requires exactly two results")
-                        except (ValueError, KeyError) as e:
-                            print(f"Pipeline percent reverse operation: {e}")
+                        except (ValueError, KeyError, ZeroDivisionError) as e:
+                            print(f"Pipeline percent reverse operation failed: {e}")
+                            op_failed = True
                         prev_was_comparison = False
                     elif operation == "percent forward":
                         try:
                             if len(result) == 2:
-                                c0, c1 = _doc_count(result[0]), _doc_count(result[1])
-                                percent = (c0 / c1) * 100 if c1 else 0
-                                final_result.append(f"{percent}")
+                                num, denom = _get_df_value(result[0]), _get_df_value(result[1])
+                                if denom == 0:
+                                    group_values.append("None")
+                                else:
+                                    percent = (num / denom) * 100
+                                    group_values.append(f"{percent}")
                             else:
                                 raise ValueError("percent forward requires exactly two results")
-                        except (ValueError, KeyError) as e:
-                            print(f"Pipeline percent forward operation: {e}")
+                        except (ValueError, KeyError, ZeroDivisionError) as e:
+                            print(f"Pipeline percent forward operation failed: {e}")
+                            op_failed = True
                         prev_was_comparison = False
                     elif operation == "total percent":
                         continue
                     elif operation == ">":
                         try:
                             if len(result) == 2:
-                                c0, c1 = _doc_count(result[0]), _doc_count(result[1])
-                                final_result.append(str(c0 > c1))
+                                v0, v1 = _get_df_value(result[0]), _get_df_value(result[1])
+                                comparison = v0 > v1
+                                group_values.append(str(comparison))
                                 prev_was_comparison = True
                             else:
                                 raise ValueError("> requires exactly two results")
                         except (ValueError, KeyError) as e:
-                            print(f"Pipeline > operation: {e}")
+                            print(f"Pipeline > operation failed: {e}")
                             prev_was_comparison = False
+                            op_failed = True
                     elif operation == "<":
                         try:
                             if len(result) == 2:
-                                c0, c1 = _doc_count(result[0]), _doc_count(result[1])
-                                final_result.append(str(c0 < c1))
+                                v0, v1 = _get_df_value(result[0]), _get_df_value(result[1])
+                                comparison = v0 < v1
+                                group_values.append(str(comparison))
                                 prev_was_comparison = True
                             else:
                                 raise ValueError("< requires exactly two results")
                         except (ValueError, KeyError) as e:
-                            print(f"Pipeline < operation: {e}")
+                            print(f"Pipeline < operation failed: {e}")
                             prev_was_comparison = False
+                            op_failed = True
                     elif operation == "bool":
                         try:
                             if len(result) >= 1:
                                 has_docs = _doc_count(result[0]) != 0
-                                final_result.append("True" if has_docs else "False")
+                                group_values.append("True" if has_docs else "False")
                                 prev_was_comparison = True
                             else:
                                 raise ValueError("bool requires at least one result")
                         except (ValueError, KeyError) as e:
-                            print(f"Pipeline bool operation: {e}")
+                            print(f"Pipeline bool operation failed: {e}")
                             prev_was_comparison = False
+                            op_failed = True
                     elif operation == "-":
                         try:
-                            if prev_was_comparison and len(result) == 2:
-                                c0, c1 = _doc_count(result[0]), _doc_count(result[1])
-                                final_result.append(f"{abs(c0 - c1)}")
-                            elif not prev_was_comparison:
-                                pass
+                            if len(result) == 2:
+                                v0, v1 = _get_df_value(result[0]), _get_df_value(result[1])
+                                difference = v0 - v1
+                                group_values.append(f"{difference}")
                             else:
                                 raise ValueError("- requires exactly two results")
                         except (ValueError, KeyError) as e:
-                            print(f"Pipeline - operation: {e}")
+                            print(f"Pipeline - operation failed: {e}")
+                            op_failed = True
                         prev_was_comparison = False
                     else:
                         prev_was_comparison = False
 
-                for df_item in result:
-                    if "extraction" in df_item.columns:
-                        final_result.append(df_item["extraction"])
+                if not group_values:
+                    for df_item in result:
+                        if df_item is None:
+                            continue
+                        if 'aggregate' in df_item.columns and len(df_item) > 0:
+                            val = df_item['aggregate'].iloc[0]
+                            if val is not None:
+                                group_values.append(str(val))
+                                break
+                        ext_cols = [c for c in df_item.columns if c.startswith("extraction")]
+                        if ext_cols and len(df_item) > 0:
+                            val = df_item[ext_cols[-1]].iloc[0]
+                            if val is not None:
+                                group_values.append(str(val))
+                                break
+                
+                if op_failed and not group_values:
+                    group_values.append("None")
+                if not group_values and has_zero_doc_df:
+                    group_values.append("None")
+                
+                final_result.extend(group_values)
+
+            extracted = tuple(final_result) if final_result else ()
 
             ground_truth = _get_ground_truth(str(DB_PATH), database_name, limited_sql) if DB_PATH.exists() and limited_sql else []
             if DB_PATH.exists() and limited_sql:
-                print(f"\nExtracted: {final_result}")
+                print(f"\nExtracted: {extracted}")
                 print(f"Ground Truth: {ground_truth}")
-                # Always compute correctness when DB is available; [] and None both normalize to empty
-                correct = _answers_match(final_result, ground_truth)
+                correct = _answers_match(extracted, ground_truth)
             else:
                 correct = None
 
@@ -891,12 +1081,13 @@ if __name__ == "__main__":
                 "num_documents": num_docs_processed,
                 "altered_sql": limited_sql,
                 "execution_time_seconds": round(execution_time_seconds, 4),
+                "pz_execution_time_seconds": round(pz_execution_time, 4),
                 "llm_total_tokens": llm_tokens,
                 "llm_total_cost": round(llm_cost, 6),
                 "correct": correct,
-                "extracted": final_result,
+                "extracted": extracted,
                 "ground_truth": ground_truth,
             })
 
-        out_path = aggregate_metrics_to_csv(metrics_rows)
+        out_path = aggregate_metrics_to_csv(metrics_rows, num_skipped_unsupported=num_skipped_unsupported)
         print(f"\nMetrics written to {out_path}")

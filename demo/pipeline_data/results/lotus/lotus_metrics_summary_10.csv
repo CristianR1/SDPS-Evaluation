@@ -1,7 +1,0 @@
-metric,value
-total_questions,61
-total_execution_time_seconds,218.4827
-total_llm_tokens,7106896
-total_llm_cost,0.760308
-num_correct,25
-accuracy,0.4098

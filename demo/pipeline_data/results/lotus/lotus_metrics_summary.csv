@@ -1,7 +1,7 @@
 metric,value
-total_questions,61
-total_execution_time_seconds,152.0091
-total_llm_tokens,7099386
-total_llm_cost,0.875971
-num_correct,25
-accuracy,0.4098
+total_questions,63
+total_execution_time_seconds,220.7862
+total_llm_tokens,8046089
+total_llm_cost,0.878497
+num_correct,31
+accuracy,0.4921

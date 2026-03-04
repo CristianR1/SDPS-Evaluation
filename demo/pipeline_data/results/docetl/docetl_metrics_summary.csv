@@ -1,0 +1,7 @@
+metric,value
+total_questions,63
+total_execution_time_seconds,1914.4713
+total_llm_tokens,0
+total_llm_cost,0
+num_correct,15
+accuracy,0.2381

@@ -1,7 +1,9 @@
 metric,value
-total_questions,61
-total_execution_time_seconds,416.2275
+total_questions,58
+total_execution_time_seconds,1719.9084
 total_llm_tokens,0
 total_llm_cost,0
-num_correct,5
-accuracy,0.082
+num_correct,16
+accuracy,0.2759
+num_skipped_unsupported,11
+unsupported_operations,"RANK (TopK), GROUP"
